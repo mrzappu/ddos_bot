@@ -1,22 +1,15 @@
 {
-  "name": "fivem-ddos-bot-ultra",
-  "version": "4.0.0",
-  "description": "Ultra-aggressive DDoS bot with proxy rotation, multi-protocol floods, and fail-fast server detection",
+  "name": "fivem-ddos-bot-final",
+  "version": "5.0.0",
+  "description": "Bulletproof DDoS bot with TCP ping, multi-wave attacks, and real-time stats",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
-    "node-fetch": "^2.7.0",
-    "express": "^4.18.2",
-    "socks": "^2.7.1",
-    "dns": "^0.2.2",
-    "http-proxy-agent": "^5.0.0",
-    "https-proxy-agent": "^5.0.1",
-    "socks-proxy-agent": "^7.0.0"
+    "express": "^4.18.2"
   },
   "engines": {
     "node": ">=18.0.0"
