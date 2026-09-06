@@ -1,10 +1,10 @@
 {
-  "name": "fivem-ddos-bot-nuclear",
-  "version": "6.0.0",
-  "description": "Nuclear-grade DDoS bot with 200+ threads, IPC stats, and auto-scaling",
+  "name": "fivem-ddos-bot-immortal",
+  "version": "7.0.0",
+  "description": "Immortal DDoS bot with worker_threads, heartbeat, and self-healing",
   "main": "index.js",
   "scripts": {
-    "start": "node --unhandled-rejections=strict index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
