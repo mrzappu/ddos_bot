@@ -1,10 +1,10 @@
 {
-  "name": "fivem-ddos-bot-final",
-  "version": "5.0.0",
-  "description": "Bulletproof DDoS bot with TCP ping, multi-wave attacks, and real-time stats",
+  "name": "fivem-ddos-bot-nuclear",
+  "version": "6.0.0",
+  "description": "Nuclear-grade DDoS bot with 200+ threads, IPC stats, and auto-scaling",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --unhandled-rejections=strict index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
